@@ -1,0 +1,362 @@
+#!/usr/bin/env RUBYOPTS=-w ruby
+# encoding: UTF-8
+#
+# !!! enforce line endings LF only !!!
+# shell may fail to correctly recognize interpreter if CR precedes or replaces LF
+#
+#---------#---------#---------#---------#---------#---------#---------#---------#---------#---------#
+#
+
+VERSION = "msync 0.2"
+LICENSE = <<-AGPLv3
+msync - synchronize mtimes of similar dirtrees
+Copyright © 2015-2016 Shad Sterling <me@shadsterling.com>
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU Affero General Public License as published by the Free Software Foundation,
+either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along with this program.
+If not, see http://www.gnu.org/licenses/agpl.html
+AGPLv3
+
+require 'ostruct'
+require 'digest'
+require 'fileutils'
+
+# TODO: check props of starting dirs
+# TODO: skip recursion into directories that only have one copy
+# TODO: make preservation of atime optional, off by default (preserve ctime by default)
+# TODO: detect when relatime will update atime and skip those files?
+# TODO: option for dry run
+# TODO: pass a "coiterator" object to block, with status and methods to alter iteration
+# indicate hardlinks? verbose mode adds row with dev and inode #s?
+
+######################
+
+
+# iterate concurrently over similar dirtrees
+# Parameters:
+#  dirs <= an array of strings containing directory paths
+#  subdir=nil <= the sub-directory for recursion
+#  block <= a block to run on each sub-path
+# Block Parameters:
+#  message <= Human-readable iteration status information
+#  path <= string of sub-path which exists in at least one of the dirs (one for each invocation of the block)
+#  stats <= an array of stat objects of this path within each of the dirs; stats[n] = lstat( File.join( dirs[n], subdir, name ) )
+# Block return:
+#  sub-paths for which the block returns true are recursed into
+def coiterate( dirs, subdir=nil, &block )
+	return if nil == block
+	subpaths = [] # entry paths (relative to dirs)
+	namehash = {} # for faster entry name recall
+	recurse = [] # entries to recurse into
+	dirs.each_with_index do |dir,i|
+		path = nil==subdir ? dir : File.join( dir, subdir )
+		#puts "#{i}: #{path}"
+		Dir.foreach( path ) do |name|
+			next if [".",".."].include?(name)
+			#puts "  / #{name}"
+			if nil == namehash[name]
+				subpath = nil==subdir ? name : File.join( subdir, name )
+				subpaths << subpath
+				namehash[name] = subpath
+			end
+		end if File.directory?( path )
+	end
+	#puts "#{pathss.count} names"
+	subpaths.sort!
+	subpaths.each do |subpath|
+		## Generate stat objcts
+		stats = []   # entry stats
+		recursable = false
+		dirs.each do |dir|
+			path = File.join( dir, subpath )
+			if File.exist?( path )
+				stat = File.lstat( path )
+				stats << stat
+				recursable = true if stat.directory?
+			else
+				stats << nil
+			end
+		end
+		if block.call( "Coiterating #{dirs.count} dirtrees", subpath, stats )
+			recurse << subpath if recursable
+		end
+	end
+	recurse.each do |subpath|
+		#puts " ** recursing into #{subpath}"
+		coiterate( dirs, subpath, &block )
+	end
+	nil
+end
+
+def md5( path, type )
+	hash = nil
+	case type
+		when "file"
+			#hash = Digest::MD5.file( path )
+			#puts "md5: #{hash}"
+			#hash = hash.base64digest
+			#puts "md5: #{hash}"
+			#hash = hash.freeze
+			#puts "md5: #{hash}"
+			hash = Digest::MD5.file( path ).base64digest.freeze
+		when "link"
+			target = File.readlink( path ).freeze
+			hash = Digest::MD5.base64digest( @target ).freeze
+	end
+	#puts "md5: #{hash.inspect} <= #{type.inspect}, #{path.inspect}"
+	return hash
+end
+
+class Info
+	FTypes = {"file"=>"file","directory"=>"dir","link"=>"symlink",nil=>"absent"}
+	FTypes.default = "other"
+
+	attr_reader :stat, :i, :basepath, :subpath, :fullpath, :type, :size, :hash, :group, :mtime, :atime
+	attr_accessor :group, :change
+
+	def initialize( i, basepath, subpath, stat )
+		@i = i
+		@basepath = basepath
+		@subpath = subpath
+		@stat = stat
+		@fullpath = File.join( @basepath, @subpath )
+		if nil == @stat
+			@type = "absent"
+		else
+			@type = FTypes[stat.ftype]
+			@size = stat.size
+			@mtime = stat.mtime
+			@atime = stat.atime
+		end
+	end
+
+	def makehash
+		if nil == @hash
+			@hash = md5( @fullpath, @stat.ftype )
+			restoretimes
+		end
+		@hash
+	end
+
+	def restoretimes
+		changed=false
+		restat = File.lstat(@fullpath)
+		if restat.atime != @atime or restat.mtime != @mtime
+			#puts "restoretimes: #{@fullpath}"
+			File.utime( @atime, @mtime, @fullpath )
+			#poststat = File.lstat( @fullpath )
+			#puts "restoretimes: original = #{@stat.inspect}"
+			#puts "restoretimes: checked  = #{restat.inspect}"
+			#puts "restoretimes: restored = #{poststat.inspect}"
+		end
+		changed
+	end
+
+	def ==(other)
+		#puts self.inspect
+		#puts other.inspect
+		r = false
+		if other.type == self.type
+			case self.type
+				when "dir", "other", "absent"
+					r = true
+				when "file", "symlink"
+					if other.size == self.size
+						if other.makehash == self.makehash
+							r = true if FileUtils.cmp( other.fullpath, self.fullpath )
+							other.restoretimes
+							self.restoretimes
+						end
+					end
+				else
+					raise "Unknown type #{self.type.inspect}"
+			end
+		end
+		r
+	end
+
+	def inspect
+		i = @i || "nil"
+		group = @group || "nil"
+		mtime = @mtime || "nil"
+		atime = @atime || "nil"
+		type = @type || "nil"
+		size = @size || "nil"
+		hash = @hash || "nil"
+		basepath = @basepath || "nil"
+		subpath = @subpath || "nil"
+		"#<Info: #{i} #{group}, #{mtime} #{atime}; #{type} #{size} #{hash}: #{basepath} / #{subpath}>"
+	end
+end
+
+
+####  ENTRY POINT  ####
+
+
+
+fmt="%Y-%m-%d %H:%M:%S %z" # for output timestamps
+width=29
+space=3
+dirs = ARGV
+dirs.each_with_index do |dir,i|
+	pre = ("|"+(" "*(width+space-1)))*i + "/"+("-"*(width+space-1))+("-"*((width+space)*(dirs.length-i)))
+	puts pre + (" "*space) + dir
+end
+puts ("|"+(" "*(width+space-1)))*dirs.length
+
+files = 0
+changed = 0
+unchanged = 0
+skipped = 0
+pathcount = 0
+multivers = 0
+
+coiterate( dirs ) do | msg, path, stats |
+	infos = stats.map.with_index do |stat,i|
+		Info.new( i, dirs[i], path, stat )
+	end
+
+	## iterate over pairs to find collisions?  How does arcdup compare files?
+	nextgroup = "A"
+	infos.each_with_index do |a,i|
+		#puts "a=#{i}: #{a.group.inspect}, #{a.fullpath}"
+		next if nil == a.stat or "other" == a.type
+		if nil == a.group
+			a.group = nextgroup
+			nextgroup = nextgroup.succ
+			#puts "a=#{i}: #{a.group.inspect}, #{a.fullpath}"
+		end
+		((i+1)...infos.length).each do |j|
+			b = infos[j]
+			#puts "b=#{j}: #{b.group.inspect}, #{b.fullpath}"
+			if nil == b.group and a == b
+				b.group = a.group
+				#puts "b=#{j}: #{b.group.inspect}, #{b.fullpath}"
+			end
+		end
+	end
+
+	#groups = infos.map(&:group).uniq #group by hash collision
+	#puts "groups: "+groups.inspect
+	members = infos.group_by(&:group)
+	members.each do |group|
+		group = group[1]
+		#puts group.inspect
+		mtimes = group.map(&:mtime)
+		change = mtimes.min
+		group.each do |info|
+			info.change = change unless info.mtime == nil or info.mtime <= change
+		end
+	end
+	groups = members.keys
+	keycount = members.keys.count
+	keycount -= 1 if groups.include?(nil)
+	pathcount += 1 if keycount > 0
+	multivers += 1 if keycount > 1
+	groups.each do |g|
+		next if nil == g
+		skip = true
+		h = "!!! BUG !!!"
+		s = "!!! BUG !!!"
+		t = "!!! BUG !!!"
+		cols = infos.map do |info|
+			r = "different"
+			skipthis = false
+			if "other" == info.type
+				r = "unsupported"
+				skipthis = false
+			elsif nil == info.stat
+				r = "absent"
+				skipthis = false
+			elsif g == info.group
+				## validation: if not nil, compare rather than assign
+				h = info.hash
+				s = info.size
+				t = info.type
+				r = info.mtime.strftime( fmt )
+				if nil == info.change
+					r = ">=#{r}=<"
+					skipthis = true
+				else
+					r = "..#{r}.."
+					skipthis = false
+				end
+			end
+			skip = false if false == skipthis
+			r = "%-#{width}s" % r
+			r
+		end
+		cols << "%4s/%13s/%24s/%s" % [ t, s.inspect, nil==h ? "nil" : h, g ]
+		cols << path
+		puts cols.join( " "*space ) unless skip
+		infos.each do |info|
+			files += 1
+			if "other" == info.type
+				skipped += 1
+			elsif nil != info.change
+				raise "attempt to change a file which was marked to be skipped" if skip
+				#puts "... #{info.fullpath}"
+				#puts "... #{info.stat.inspect}"
+				File.utime( info.atime, info.change, info.fullpath )
+				#puts "... #{File.lstat(info.fullpath).inspect}"
+				changed += 1
+			else
+				unchanged += 1
+			end
+		end
+	end
+
+	if false
+
+	#infos.each_with_index { |info,i| puts "#{i}: #{info.type}/#{info.size.inspect}/#{info.hash.inspect}/#{info.group.inspect} #{info.subpath}" }
+
+	types = infos.map(&:type).uniq
+	#puts "types: "+types.inspect
+	sizes = infos.map(&:size).uniq
+	#puts "sizes: "+sizes.inspect
+	hashes = infos.map(&:hash).uniq
+	#puts "hashes: "+hashes.inspect
+	groups = infos.map(&:group).uniq #group by hash collision
+	#puts "groups: "+groups.inspect
+
+	types.each do |t|
+		next if [nil,"other","absent"].include?(t)
+		sizes.each do |s|
+			next if nil == s
+			hashes.each do |h|
+				groups.each do |g|
+					next if nil == g
+					cols = infos.map do |info|
+						r = "different"
+						if nil == info.stat
+							r = "absent"
+						elsif "other" == info.type
+							r = "unsupported"
+						elsif t == info.type and s == info.size and h == info.hash and g == info.group
+							r = info.mtime
+						end
+						r = "%-#{width}s" % r
+						r
+					end
+					cols << "%4s/%13s/%26s/%s" % [ t, s.inspect, h.inspect, g.inspect ]
+					cols << path
+					puts cols.join( " "*space )
+				end
+			end
+		end
+	end
+
+	end
+
+	true
+end
+
+puts "#{pathcount} sub-paths, #{multivers} with multiple versions, #{files} total entries; #{changed} changed, #{unchanged} unchanged, #{skipped} skipped"
+
