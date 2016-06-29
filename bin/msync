@@ -7,7 +7,7 @@
 #---------#---------#---------#---------#---------#---------#---------#---------#---------#---------#
 #
 
-VERSION = "msync 0.2"
+VERSION = "msync 0.3"
 LICENSE = <<-AGPLv3
 msync - synchronize mtimes of similar dirtrees
 Copyright © 2015-2016 Shad Sterling <me@shadsterling.com>
@@ -28,9 +28,10 @@ require 'ostruct'
 require 'digest'
 require 'fileutils'
 
+# TODO: fix bug where some files appear to have wrong mtime
 # TODO: check props of starting dirs
-# TODO: skip recursion into directories that only have one copy
 # TODO: make preservation of atime optional, off by default (preserve ctime by default)
+# TODO: update perms to newest (by ctime); ctime will change, so preserve atime for these nodes
 # TODO: detect when relatime will update atime and skip those files?
 # TODO: option for dry run
 # TODO: pass a "coiterator" object to block, with status and methods to alter iteration
@@ -108,7 +109,7 @@ def md5( path, type )
 			hash = Digest::MD5.file( path ).base64digest.freeze
 		when "link"
 			target = File.readlink( path ).freeze
-			hash = Digest::MD5.base64digest( @target ).freeze
+			hash = Digest::MD5.base64digest( target ).freeze
 	end
 	#puts "md5: #{hash.inspect} <= #{type.inspect}, #{path.inspect}"
 	return hash
@@ -118,8 +119,29 @@ class Info
 	FTypes = {"file"=>"file","directory"=>"dir","link"=>"symlink",nil=>"absent"}
 	FTypes.default = "other"
 
-	attr_reader :stat, :i, :basepath, :subpath, :fullpath, :type, :size, :hash, :group, :mtime, :atime
+	attr_reader :stat, :i, :basepath, :subpath, :fullpath, :type, :size, :hash, :group, :mtime, :atime, :mode
 	attr_accessor :group, :change
+
+	def self.modestring( mode )
+		if nil == mode
+			r = "nil"
+		else
+			r = (mode > 07777) ? "#{(mode>>11).to_s(8)}?" : ""
+			r += (mode&(1<<11)!=0) ? "u" : "-" # run as owner user; see https://www.gnu.org/software/libc/manual/html_node/Permission-Bits.html#Permission-Bits
+			r += (mode&(1<<10)!=0) ? "g" : "-" # run as owner group; see https://www.gnu.org/software/libc/manual/html_node/Permission-Bits.html#Permission-Bits
+			r += (mode&(1<<9)!=0) ? "s" : "-" # "sticky" (direntry mods require perms on linked file); see https://www.gnu.org/software/libc/manual/html_node/Permission-Bits.html#Permission-Bits
+			r += (mode&(1<<8)!=0) ? "r" : "-" # owner - read
+			r += (mode&(1<<7)!=0) ? "w" : "-" # owner - write
+			r += (mode&(1<<6)!=0) ? "x" : "-" # owner - execute
+			r += (mode&(1<<5)!=0) ? "r" : "-" # group - read
+			r += (mode&(1<<4)!=0) ? "w" : "-" # group - write
+			r += (mode&(1<<3)!=0) ? "x" : "-" # group - execute
+			r += (mode&(1<<2)!=0) ? "r" : "-" # other - read
+			r += (mode&(1<<1)!=0) ? "w" : "-" # other - write
+			r += (mode&(1<<0)!=0) ? "x" : "-" # other - execute
+		end
+		return r
+	end
 
 	def initialize( i, basepath, subpath, stat )
 		@i = i
@@ -134,6 +156,7 @@ class Info
 			@size = stat.size
 			@mtime = stat.mtime
 			@atime = stat.atime
+			@mode = stat.mode
 		end
 	end
 
@@ -163,7 +186,7 @@ class Info
 		#puts self.inspect
 		#puts other.inspect
 		r = false
-		if other.type == self.type
+		if other.type == self.type and other.mode == self.mode
 			case self.type
 				when "dir", "other", "absent"
 					r = true
@@ -187,12 +210,13 @@ class Info
 		group = @group || "nil"
 		mtime = @mtime || "nil"
 		atime = @atime || "nil"
+		perms = Info.modestring(@mode)
 		type = @type || "nil"
 		size = @size || "nil"
 		hash = @hash || "nil"
 		basepath = @basepath || "nil"
 		subpath = @subpath || "nil"
-		"#<Info: #{i} #{group}, #{mtime} #{atime}; #{type} #{size} #{hash}: #{basepath} / #{subpath}>"
+		"#<Info: #{i} #{group}, #{mtime} #{atime} #{perms}; #{type} #{size} #{hash}: #{basepath} / #{subpath}>"
 	end
 end
 
@@ -216,14 +240,25 @@ changed = 0
 unchanged = 0
 skipped = 0
 pathcount = 0
+prunecount = 0
 multivers = 0
 
 coiterate( dirs ) do | msg, path, stats |
+	dircount = 0
+	nilcount = 0
+	hamcount = 0
 	infos = stats.map.with_index do |stat,i|
-		Info.new( i, dirs[i], path, stat )
+		if nil == stat
+			nilcount += 1
+		else
+			hamcount += 1
+		end
+		i = Info.new( i, dirs[i], path, stat )
+		dircount += 1 if "dir" == i.type
+		i
 	end
+	prune = 1 == dircount
 
-	## iterate over pairs to find collisions?  How does arcdup compare files?
 	nextgroup = "A"
 	infos.each_with_index do |a,i|
 		#puts "a=#{i}: #{a.group.inspect}, #{a.fullpath}"
@@ -243,39 +278,39 @@ coiterate( dirs ) do | msg, path, stats |
 		end
 	end
 
-	#groups = infos.map(&:group).uniq #group by hash collision
 	#puts "groups: "+groups.inspect
-	members = infos.group_by(&:group)
-	members.each do |group|
-		group = group[1]
-		#puts group.inspect
-		mtimes = group.map(&:mtime)
-		change = mtimes.min
-		group.each do |info|
-			info.change = change unless info.mtime == nil or info.mtime <= change
+	groups = infos.group_by(&:group)
+	groups.each_pair do |group,members|
+		#puts "#{group}: #{members}"
+		#mtimes = members.map(&:mtime)
+		#change = mtimes.min
+		change = members.map(&:mtime).min
+		members.each do |info|
+			info.change = change unless nil == info.mtime or change >= info.mtime
 		end
 	end
-	groups = members.keys
-	keycount = members.keys.count
-	keycount -= 1 if groups.include?(nil)
+	keycount = groups.count
+	keycount -= 1 if groups.has_key?(nil)
 	pathcount += 1 if keycount > 0
+	prunecount += 1 if prune
 	multivers += 1 if keycount > 1
-	groups.each do |g|
-		next if nil == g
+
+	groups.each_pair do |group,members|
+		next if nil == group
 		skip = true
 		h = "!!! BUG !!!"
 		s = "!!! BUG !!!"
 		t = "!!! BUG !!!"
 		cols = infos.map do |info|
-			r = "different"
+			r = "conflict"
 			skipthis = false
 			if "other" == info.type
 				r = "unsupported"
 				skipthis = false
 			elsif nil == info.stat
-				r = "absent"
+				r = prune ? "pruned" : "absent"
 				skipthis = false
-			elsif g == info.group
+			elsif group == info.group
 				## validation: if not nil, compare rather than assign
 				h = info.hash
 				s = info.size
@@ -288,24 +323,25 @@ coiterate( dirs ) do | msg, path, stats |
 					r = "..#{r}.."
 					skipthis = false
 				end
+				raise "WTF" if info.mtime != info.stat.mtime
 			end
 			skip = false if false == skipthis
 			r = "%-#{width}s" % r
 			r
 		end
-		cols << "%4s/%13s/%24s/%s" % [ t, s.inspect, nil==h ? "nil" : h, g ]
-		cols << path
-		puts cols.join( " "*space ) unless skip
+		if not skip and not prune and 1 < hamcount
+			p = Info.modestring(members[0].mode)
+			cols << "%7s/%13s/%13s/%24s/%s" % [ t, s.inspect, p, nil==h ? "nil" : h, group ]
+			cols << path
+			puts cols.join( " "*space )
+		end
 		infos.each do |info|
 			files += 1
 			if "other" == info.type
 				skipped += 1
 			elsif nil != info.change
-				raise "attempt to change a file which was marked to be skipped" if skip
-				#puts "... #{info.fullpath}"
-				#puts "... #{info.stat.inspect}"
+				raise "attempt to change a file which was marked to be skipped: #{info.fullpath}; #{info.stat.inspect}" if skip
 				File.utime( info.atime, info.change, info.fullpath )
-				#puts "... #{File.lstat(info.fullpath).inspect}"
 				changed += 1
 			else
 				unchanged += 1
@@ -313,50 +349,8 @@ coiterate( dirs ) do | msg, path, stats |
 		end
 	end
 
-	if false
-
-	#infos.each_with_index { |info,i| puts "#{i}: #{info.type}/#{info.size.inspect}/#{info.hash.inspect}/#{info.group.inspect} #{info.subpath}" }
-
-	types = infos.map(&:type).uniq
-	#puts "types: "+types.inspect
-	sizes = infos.map(&:size).uniq
-	#puts "sizes: "+sizes.inspect
-	hashes = infos.map(&:hash).uniq
-	#puts "hashes: "+hashes.inspect
-	groups = infos.map(&:group).uniq #group by hash collision
-	#puts "groups: "+groups.inspect
-
-	types.each do |t|
-		next if [nil,"other","absent"].include?(t)
-		sizes.each do |s|
-			next if nil == s
-			hashes.each do |h|
-				groups.each do |g|
-					next if nil == g
-					cols = infos.map do |info|
-						r = "different"
-						if nil == info.stat
-							r = "absent"
-						elsif "other" == info.type
-							r = "unsupported"
-						elsif t == info.type and s == info.size and h == info.hash and g == info.group
-							r = info.mtime
-						end
-						r = "%-#{width}s" % r
-						r
-					end
-					cols << "%4s/%13s/%26s/%s" % [ t, s.inspect, h.inspect, g.inspect ]
-					cols << path
-					puts cols.join( " "*space )
-				end
-			end
-		end
-	end
-
-	end
-
-	true
+	!prune
 end
 
-puts "#{pathcount} sub-paths, #{multivers} with multiple versions, #{files} total entries; #{changed} changed, #{unchanged} unchanged, #{skipped} skipped"
+puts "#{pathcount} sub-paths (#{prunecount} branches pruned), #{multivers} with conflicting versions, #{files} total entries; #{changed} changed, #{unchanged} unchanged, #{skipped} skipped"
 
